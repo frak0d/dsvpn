@@ -2,6 +2,7 @@
 #include "charm.h"
 #include "os.h"
 
+#define WEBSOCKET_HEADERS_LEN 1024
 static const int POLLFD_TUN = 0, POLLFD_LISTENER = 1, POLLFD_CLIENT = 2, POLLFD_COUNT = 3;
 
 typedef struct __attribute__((aligned(16))) Buf_ {
@@ -29,6 +30,7 @@ typedef struct Context_ {
     char          server_ip[64];
     char          if_name[IFNAMSIZ];
     int           is_server;
+    int           use_websocket;
     int           tun_fd;
     int           client_fd;
     int           listen_fd;
@@ -175,6 +177,33 @@ static void client_disconnect(Context *context)
     memset(context->uc_st, 0, sizeof context->uc_st);
 }
 
+static int server_websocket_exchange(const int client_fd)
+{
+    char websocket_headers[WEBSOCKET_HEADERS_LEN];
+
+    if (safe_read(client_fd, websocket_headers, sizeof websocket_headers, ACCEPT_TIMEOUT) !=
+            sizeof websocket_headers ||
+        memcmp(&websocket_headers[sizeof websocket_headers - 9], "VPN\r\n\r\n", 8) != 0) {
+        return -1;
+    }
+    memset(websocket_headers, '-', sizeof websocket_headers);
+    snprintf(websocket_headers, sizeof websocket_headers,
+             "HTTP/1.1 101 Web Socket Protocol Handshake\r\n"
+             "Connection: Upgrade\r\n"
+             "Server: dsvpn/" VERSION_STRING
+             "\r\n"
+             "Upgrade: websocket\r\n"
+             "Sec-WebSocket-Accept: WNebq7bp/cdGYMO8cNknMBXq2Sk=\r\n"
+             "X-Pad: ");
+    websocket_headers[strlen(websocket_headers)] = '-';
+    memcpy(&websocket_headers[sizeof websocket_headers - 9], "VPN\r\n\r\n", 8);
+    if (safe_write(client_fd, websocket_headers, sizeof websocket_headers, ACCEPT_TIMEOUT) !=
+        sizeof websocket_headers) {
+        return -1;
+    }
+    return 0;
+}
+
 static int server_key_exchange(Context *context, const int client_fd)
 {
     uint32_t st[12];
@@ -184,8 +213,11 @@ static int server_key_exchange(Context *context, const int client_fd)
     uint8_t  iv[16] = { 0 };
     uint64_t ts, now;
 
-    memcpy(st, context->uc_kx_st, sizeof st);
     errno = EACCES;
+    if (context->use_websocket && server_websocket_exchange(client_fd) != 0) {
+        return -1;
+    }
+    memcpy(st, context->uc_kx_st, sizeof st);
     if (safe_read(client_fd, pkt1, sizeof pkt1, ACCEPT_TIMEOUT) != sizeof pkt1) {
         return -1;
     }
@@ -260,6 +292,35 @@ static int tcp_accept(Context *context, int listen_fd)
     return client_fd;
 }
 
+static int client_websocket_exchange(Context *context)
+{
+    char websocket_headers[WEBSOCKET_HEADERS_LEN];
+
+    memset(websocket_headers, '-', sizeof websocket_headers);
+    snprintf(websocket_headers, sizeof websocket_headers,
+             "GET / HTTP/1.1\r\n"
+             "Host: %s\r\n"
+             "User-Agent: dsvpn/" VERSION_STRING
+             "\r\n"
+             "Connection: Upgrade\r\n"
+             "Upgrade: websocket\r\n"
+             "Sec-WebSocket-Key: ZHN2cG4=\r\n"
+             "X-Pad: ",
+             context->server_ip_or_name);
+    websocket_headers[strlen(websocket_headers)] = '-';
+    memcpy(&websocket_headers[sizeof websocket_headers - 9], "VPN\r\n\r\n", 8);
+    if (safe_write(context->client_fd, websocket_headers, sizeof websocket_headers,
+                   ACCEPT_TIMEOUT) != sizeof websocket_headers) {
+        return -1;
+    }
+    if (safe_read(context->client_fd, websocket_headers, sizeof websocket_headers, TIMEOUT) !=
+            sizeof websocket_headers ||
+        memcmp(&websocket_headers[sizeof websocket_headers - 9], "VPN\r\n\r\n", 8) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int client_key_exchange(Context *context)
 {
     uint32_t st[12];
@@ -269,6 +330,10 @@ static int client_key_exchange(Context *context)
     uint8_t  iv[16] = { 0 };
     uint64_t now;
 
+    errno = EACCES;
+    if (context->use_websocket && client_websocket_exchange(context) != 0) {
+        return -1;
+    }
     memcpy(st, context->uc_kx_st, sizeof st);
     uc_randombytes_buf(pkt1, 32);
     now = endian_swap64(time(NULL));
@@ -511,12 +576,13 @@ __attribute__((noreturn)) static void usage(void)
          " usage:\n"
          "\n"
          "dsvpn\t\"server\"\n\t<key file>\n\t<vpn server ip or name>|\"auto\"\n\t<vpn "
-         "server port>|\"auto\"\n\t<tun interface>|\"auto\"\n\t<local tun "
-         "ip>|\"auto\"\n\t<remote tun ip>\"auto\"\n\t<external ip>|\"auto\""
+         "server port>|\"auto\"\n\t<tun interface>|\"auto\"\n\t<local tun ip>|\"auto\"\n\t<remote "
+         "tun ip>\"auto\"\n\t<external ip>|\"auto\"\n\t<protocol>|\"auto\""
          "\n\n"
          "dsvpn\t\"client\"\n\t<key file>\n\t<vpn server ip or name>\n\t<vpn server "
-         "port>|\"auto\"\n\t<tun interface>|\"auto\"\n\t<local tun "
-         "ip>|\"auto\"\n\t<remote tun ip>|\"auto\"\n\t<gateway ip>|\"auto\"\n\n"
+         "port>|\"auto\"\n\t<tun interface>|\"auto\"\n\t<local tun ip>|\"auto\"\n\t<remote tun "
+         "ip>|\"auto\"\n\t<gateway ip>|\"auto\"\n\t<protocol>|\"auto\""
+         "\n\n"
          "Example:\n\n[server]\n\tdd if=/dev/urandom of=vpn.key count=1 bs=32\t# create key\n"
          "\tbase64 < vpn.key\t\t# copy key as a string\n\tsudo ./dsvpn server vpn.key\t# listen on "
          "443\n\n[client]\n\techo ohKD...W4= | base64 --decode > vpn.key\t# paste key\n"
@@ -558,6 +624,7 @@ int main(int argc, char *argv[])
 {
     Context     context;
     const char *ext_gw_ip;
+    const char *default_port = DEFAULT_PORT;
 
     if (argc < 3) {
         usage();
@@ -572,7 +639,12 @@ int main(int argc, char *argv[])
     if (context.server_ip_or_name == NULL && !context.is_server) {
         usage();
     }
-    context.server_port    = (argc <= 4 || strcmp(argv[4], "auto") == 0) ? DEFAULT_PORT : argv[4];
+    context.use_websocket = (argc <= 9 || strcmp(argv[9], "websocket") != 0) ? 0 : 1;
+    if (context.use_websocket) {
+        puts("VPN-over-WebSocket enabled");
+        default_port = "80";
+    }
+    context.server_port    = (argc <= 4 || strcmp(argv[4], "auto") == 0) ? default_port : argv[4];
     context.wanted_if_name = (argc <= 5 || strcmp(argv[5], "auto") == 0) ? NULL : argv[5];
     context.local_tun_ip   = (argc <= 6 || strcmp(argv[6], "auto") == 0)
                                ? (context.is_server ? DEFAULT_SERVER_IP : DEFAULT_CLIENT_IP)
